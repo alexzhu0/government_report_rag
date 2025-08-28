@@ -1,3 +1,12 @@
 fastapi
 uvicorn
-pydantic 
+pydantic
+aiohttp
+requests
+numpy
+faiss-cpu
+torch
+transformers
+tqdm
+scikit-learn
+openai>=1.0.0 

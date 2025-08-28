@@ -9,7 +9,7 @@ start "API Server" cmd /c "call start_api.bat"
 
 echo.
 echo Waiting for API server to start...
-timeout /t 15 /nobreak >nul
+timeout /t 60 /nobreak >nul
 
 echo.
 echo Step 2: Initializing RAG system...

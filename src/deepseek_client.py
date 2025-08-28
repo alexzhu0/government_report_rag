@@ -1,18 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-硅基流动API客户端
-负责与LLM模型交互
+DeepSeek官方API客户端
+使用直接HTTP请求方式，避免OpenAI SDK版本兼容问题
 """
 
-import json
 import logging
 import time
+import json
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import asyncio
-import aiohttp
 
 import requests
 
@@ -24,7 +22,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class APIResponse:
     """API响应数据结构"""
-
     success: bool
     content: str
     usage: Optional[Dict] = None
@@ -32,40 +29,35 @@ class APIResponse:
     response_time: Optional[float] = None
 
 
-class SiliconFlowClient:
-    """硅基流动API客户端"""
+class DeepSeekClient:
+    """DeepSeek官方API客户端 - 使用直接HTTP请求"""
 
     def __init__(
-        self, api_key: str, base_url: str, model: str = "deepseek-ai/DeepSeek-R1"
+        self, 
+        api_key: str, 
+        base_url: str = "https://api.deepseek.com",
+        model: str = "deepseek-chat"
     ):
         """
-        初始化API客户端
+        初始化DeepSeek API客户端
 
         Args:
-            api_key: API密钥
+            api_key: DeepSeek API密钥
             base_url: API基础URL
             model: 使用的模型名称
         """
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.rstrip('/')
         self.model = model
-        self.session = requests.Session()
         
-        # 连接池配置优化
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=20,
-            pool_maxsize=20,
-            max_retries=3
-        )
-        self.session.mount('http://', adapter)
-        self.session.mount('https://', adapter)
-
-        # 设置请求头
-        self.session.headers.update(
-            {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-        )
-
-        logger.info("🚀 初始化硅基流动API客户端")
+        # 创建session以复用连接
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        })
+        
+        logger.info("🚀 初始化DeepSeek API客户端")
         logger.info(f"🔗 Base URL: {base_url}")
         logger.info(f"🤖 模型: {model}")
 
@@ -73,8 +65,8 @@ class SiliconFlowClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.3,
-        max_tokens: int = 8192,
-        timeout: int = 180,
+        max_tokens: int = 8000,
+        timeout: int = 60,
     ) -> APIResponse:
         """
         调用聊天完成API
@@ -88,45 +80,30 @@ class SiliconFlowClient:
         Returns:
             APIResponse: API响应结果
         """
-        url = f"{self.base_url}/chat/completions"
-
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-
         start_time = time.time()
 
         try:
-            logger.debug(f"📤 发送请求到: {url}")
+            logger.debug(f"📤 发送请求到DeepSeek API")
             logger.debug(f"📝 消息数量: {len(messages)}")
 
-            response = self.session.post(url, json=payload, timeout=timeout)
+            url = f"{self.base_url}/chat/completions"
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": False
+            }
 
+            response = self.session.post(url, json=payload, timeout=timeout)
             response_time = time.time() - start_time
 
-            # 检查HTTP状态码
-            if response.status_code != 200:
-                error_msg = f"HTTP {response.status_code}: {response.text}"
-                logger.error(f"❌ API请求失败: {error_msg}")
-                return APIResponse(
-                    success=False,
-                    content="",
-                    error=error_msg,
-                    response_time=response_time,
-                )
-
-            # 解析响应
-            result = response.json()
-
-            if "choices" in result and len(result["choices"]) > 0:
+            if response.status_code == 200:
+                result = response.json()
                 content = result["choices"][0]["message"]["content"]
                 usage = result.get("usage", {})
 
-                logger.info(f"✅ API调用成功 ({response_time:.2f}s)")
+                logger.info(f"✅ DeepSeek API调用成功 ({response_time:.2f}s)")
                 logger.debug(f"📊 Token使用: {usage}")
 
                 return APIResponse(
@@ -136,8 +113,8 @@ class SiliconFlowClient:
                     response_time=response_time,
                 )
             else:
-                error_msg = "响应格式异常: 缺少choices字段"
-                logger.error(f"❌ {error_msg}")
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                logger.error(f"❌ DeepSeek API调用失败: {error_msg}")
                 return APIResponse(
                     success=False,
                     content="",
@@ -176,8 +153,9 @@ class SiliconFlowClient:
             )
 
         except Exception as e:
-            error_msg = f"未知错误: {str(e)}"
-            logger.error(f"❓ {error_msg}")
+            error_msg = f"DeepSeek API调用失败: {str(e)}"
+            logger.error(f"❌ {error_msg}")
+            
             return APIResponse(
                 success=False,
                 content="",
@@ -212,11 +190,11 @@ class SiliconFlowClient:
         self,
         queries: List[str],
         system_message: str = None,
-        max_workers: int = 5,
+        max_workers: int = 8,
         timeout_per_request: int = 60,
     ) -> List[APIResponse]:
         """
-        并发批量处理查询 - 性能优化版本
+        并发批量处理查询
 
         Args:
             queries: 查询列表
@@ -230,7 +208,7 @@ class SiliconFlowClient:
         if not queries:
             return []
 
-        logger.info(f"🚀 开始并发批量处理: {len(queries)} 个查询，{max_workers} 个工作线程")
+        logger.info(f"🚀 开始DeepSeek并发批量处理: {len(queries)} 个查询，{max_workers} 个工作线程")
         results = [None] * len(queries)
         start_time = time.time()
 
@@ -247,19 +225,17 @@ class SiliconFlowClient:
             }
 
             # 收集结果
-            completed_count = 0
-            for future in as_completed(future_to_index, timeout=300):  # 总超时5分钟
+            for future in as_completed(future_to_index, timeout=300):
                 index = future_to_index[future]
                 try:
                     result = future.result()
                     results[index] = result
-                    completed_count += 1
                     
                     status = "✅" if result.success else "❌"
-                    logger.debug(f"{status} 查询 {index + 1}/{len(queries)} 完成")
+                    logger.debug(f"{status} DeepSeek查询 {index + 1}/{len(queries)} 完成")
                     
                 except Exception as e:
-                    logger.error(f"❌ 查询 {index + 1} 异常: {str(e)}")
+                    logger.error(f"❌ DeepSeek查询 {index + 1} 异常: {str(e)}")
                     results[index] = APIResponse(
                         success=False,
                         content="",
@@ -278,101 +254,43 @@ class SiliconFlowClient:
         processing_time = time.time() - start_time
         success_count = sum(1 for r in results if r.success)
         
-        logger.info(f"📊 并发批量处理完成: {success_count}/{len(queries)} 成功 ({processing_time:.2f}s)")
+        logger.info(f"📊 DeepSeek并发批量处理完成: {success_count}/{len(queries)} 成功 ({processing_time:.2f}s)")
         logger.info(f"⚡ 平均速度: {processing_time / len(queries):.2f}s/查询")
-
-        return results
-
-    def batch_process(
-        self,
-        queries: List[str],
-        system_message: str = None,
-        max_retries: int = 3,
-        delay_between_requests: float = 1.0,
-    ) -> List[APIResponse]:
-        """
-        批量处理查询
-
-        Args:
-            queries: 查询列表
-            system_message: 系统消息
-            max_retries: 最大重试次数
-            delay_between_requests: 请求间延迟（秒）
-
-        Returns:
-            List[APIResponse]: 响应列表
-        """
-        results = []
-
-        for i, query in enumerate(queries):
-            logger.info(f"🔄 处理查询 {i + 1}/{len(queries)}")
-
-            retry_count = 0
-            while retry_count < max_retries:
-                response = self.simple_chat(query, system_message)
-
-                if response.success:
-                    results.append(response)
-                    break
-                else:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        logger.warning(f"⚠️ 查询失败，重试 {retry_count}/{max_retries}")
-                        time.sleep(delay_between_requests * retry_count)
-                    else:
-                        logger.error(f"❌ 查询最终失败: {response.error}")
-                        results.append(response)
-
-            # 请求间延迟
-            if i < len(queries) - 1:
-                time.sleep(delay_between_requests)
-
-        success_count = sum(1 for r in results if r.success)
-        logger.info(f"📊 批量处理完成: {success_count}/{len(queries)} 成功")
 
         return results
 
     def test_connection(self) -> bool:
         """
-        测试API连接
+        测试DeepSeek API连接
 
         Returns:
             bool: 连接是否成功
         """
-        logger.info("🔍 测试API连接...")
+        logger.info("🔍 测试DeepSeek API连接...")
 
         response = self.simple_chat("你好，请回复'连接成功'", max_tokens=50, timeout=30)
 
         if response.success:
-            logger.info("✅ API连接测试成功")
+            logger.info("✅ DeepSeek API连接测试成功")
             return True
         else:
-            logger.error(f"❌ API连接测试失败: {response.error}")
+            logger.error(f"❌ DeepSeek API连接测试失败: {response.error}")
             return False
 
 
-# 全局客户端实例
-_api_client = None
+# 全局DeepSeek客户端实例
+_deepseek_client = None
 
 
-def get_api_client():
-    """获取全局API客户端实例 - 支持多个提供商"""
-    global _api_client
-    if _api_client is None:
-        from config.config import API_PROVIDER, SILICONFLOW_CONFIG, DEEPSEEK_CONFIG
-        
-        if API_PROVIDER == "deepseek":
-            # 使用DeepSeek官方API
-            from deepseek_client import get_deepseek_client
-            _api_client = get_deepseek_client()
-            logger.info("🔄 使用DeepSeek官方API客户端")
-        else:
-            # 默认使用硅基流动API
-            _api_client = SiliconFlowClient(
-                api_key=SILICONFLOW_CONFIG["api_key"],
-                base_url=SILICONFLOW_CONFIG["base_url"],
-                model=SILICONFLOW_CONFIG["model"],
-            )
-            logger.info("🔄 使用硅基流动API客户端")
-    
-    return _api_client
+def get_deepseek_client() -> DeepSeekClient:
+    """获取全局DeepSeek客户端实例"""
+    global _deepseek_client
+    if _deepseek_client is None:
+        from config.config import DEEPSEEK_CONFIG
+
+        _deepseek_client = DeepSeekClient(
+            api_key=DEEPSEEK_CONFIG["api_key"],
+            base_url=DEEPSEEK_CONFIG["base_url"],
+            model=DEEPSEEK_CONFIG["model"],
+        )
+    return _deepseek_client

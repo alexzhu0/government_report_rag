@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 
 from api_client import get_api_client
 from retriever import get_retriever
+from query_cache import get_query_cache
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +36,7 @@ class QueryRouter:
         """初始化查询路由器"""
         self.retriever = get_retriever()
         self.api_client = get_api_client()
+        self.query_cache = get_query_cache()  # 添加缓存支持
 
         # 输出格式模板
         self.output_templates = {
@@ -159,36 +161,71 @@ class QueryRouter:
 
     def execute_query_plan(self, plan: QueryPlan) -> Dict[str, Any]:
         """
-        执行查询计划
-
+        执行查询计划 - 支持缓存和并发优化
+        
         Args:
             plan: 查询执行计划
-
+            
         Returns:
             Dict: 执行结果
         """
         logger.info(f"🚀 执行查询计划: {plan.batch_strategy}")
 
+        # 检查缓存
+        cache_key_data = {
+            "query_type": plan.query_type,
+            "batch_strategy": plan.batch_strategy,
+            "batches": len(plan.batches),
+            "output_format": plan.output_format
+        }
+        
+        # 为每个批次生成查询列表
+        batch_queries = [batch.get("query", "") for batch in plan.batches]
+        cache_key_data["batch_queries"] = batch_queries
+        
+        # 尝试从缓存获取结果
+        cached_result = self.query_cache.get("execute_query_plan", **cache_key_data)
+        if cached_result:
+            logger.info("✅ 从缓存获取查询结果")
+            return {
+                "success": True,
+                "content": cached_result.content,
+                "provinces": cached_result.provinces,
+                "query_plan": plan,
+                "batch_results": [],  # 缓存结果不包含详细批次信息
+                "total_batches": len(plan.batches),
+                "successful_batches": len(plan.batches),
+                "total_provinces": len(cached_result.provinces),
+                "total_processing_time": cached_result.processing_time,
+                "from_cache": True
+            }
+
         results = []
         all_provinces = set()
         total_processing_time = 0
 
-        for i, batch in enumerate(plan.batches):
-            logger.info(f"📦 处理批次 {i + 1}/{len(plan.batches)}")
+        # 检查是否可以并发执行
+        if len(plan.batches) > 1 and plan.batch_strategy in ["province_groups", "province_chunks"]:
+            logger.info(f"⚡ 使用并发执行: {len(plan.batches)} 个批次")
+            results = self._execute_batches_concurrently(plan.batches, plan.output_format)
+        else:
+            # 串行执行
+            for i, batch in enumerate(plan.batches):
+                logger.info(f"📦 处理批次 {i + 1}/{len(plan.batches)}")
 
-            try:
-                batch_result = self._execute_single_batch(batch, plan.output_format)
-                if batch_result["success"]:
-                    results.append(batch_result)
-                    all_provinces.update(batch_result.get("provinces", []))
-                    total_processing_time += batch_result.get("processing_time", 0)
-                else:
-                    logger.warning(
-                        f"⚠️ 批次 {i + 1} 执行失败: {batch_result.get('error')}"
-                    )
+                try:
+                    batch_result = self._execute_single_batch(batch, plan.output_format)
+                    if batch_result["success"]:
+                        results.append(batch_result)
+                        all_provinces.update(batch_result.get("provinces", []))
+                        total_processing_time += batch_result.get("processing_time", 0)
+                    else:
+                        logger.warning(
+                            f"⚠️ 批次 {i + 1} 执行失败: {batch_result.get('error')}"
+                        )
 
-            except Exception as e:
-                logger.error(f"❌ 批次 {i + 1} 执行异常: {str(e)}")
+                except Exception as e:
+                    logger.error(f"❌ 批次 {i + 1} 执行异常: {str(e)}")
 
         # 聚合结果
         final_result = self._aggregate_results(results, plan)
@@ -196,10 +233,27 @@ class QueryRouter:
             {
                 "total_batches": len(plan.batches),
                 "successful_batches": len(results),
-                "total_provinces": len(all_provinces),
+                "total_provinces": len(all_provinces) if all_provinces else len(final_result.get("provinces", [])),
                 "total_processing_time": total_processing_time,
+                "from_cache": False
             }
         )
+
+        # 保存到缓存
+        if final_result.get("success", False):
+            cache_result = {
+                "content": final_result.get("content", ""),
+                "provinces": final_result.get("provinces", []),
+                "query_type": plan.query_type,
+                "output_format": plan.output_format,
+                "processing_time": total_processing_time,
+                "processing_stats": {
+                    "success_rate": len(results) / len(plan.batches) if plan.batches else 0,
+                    "total_batches": len(plan.batches),
+                    "successful_batches": len(results)
+                }
+            }
+            self.query_cache.put("execute_query_plan", cache_result, **cache_key_data)
 
         logger.info(f"✅ 查询执行完成: {len(results)}/{len(plan.batches)} 批次成功")
         return final_result
@@ -435,6 +489,63 @@ class QueryRouter:
 请基于参考资料回答问题。"""
 
         return prompt
+
+    def _execute_batches_concurrently(self, batches: List[Dict], output_format: str) -> List[Dict[str, Any]]:
+        """
+        并发执行批次 - 性能优化
+        
+        Args:
+            batches: 批次列表
+            output_format: 输出格式
+            
+        Returns:
+            List[Dict]: 批次执行结果列表
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+        
+        start_time = time.time()
+        results = []
+        max_workers = min(len(batches), 4)  # 限制并发数，避免API限流
+        
+        logger.info(f"⚡ 开始并发执行: {len(batches)} 个批次，{max_workers} 个工作线程")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有批次任务
+            future_to_batch = {
+                executor.submit(self._execute_single_batch, batch, output_format): i
+                for i, batch in enumerate(batches)
+            }
+            
+            # 收集结果
+            for future in as_completed(future_to_batch, timeout=600):  # 10分钟总超时
+                batch_index = future_to_batch[future]
+                try:
+                    result = future.result()
+                    result["batch_index"] = batch_index
+                    results.append(result)
+                    
+                    status = "✅" if result["success"] else "❌"
+                    logger.debug(f"{status} 批次 {batch_index + 1} 完成")
+                    
+                except Exception as e:
+                    logger.error(f"❌ 批次 {batch_index + 1} 异常: {str(e)}")
+                    results.append({
+                        "success": False,
+                        "error": str(e),
+                        "batch_index": batch_index,
+                        "processing_time": 0,
+                        "provinces": []
+                    })
+        
+        # 按原始顺序排序结果
+        results.sort(key=lambda x: x.get("batch_index", 0))
+        
+        processing_time = time.time() - start_time
+        success_count = sum(1 for r in results if r["success"])
+        
+        logger.info(f"⚡ 并发执行完成: {success_count}/{len(batches)} 成功 ({processing_time:.2f}s)")
+        return results
 
     def _aggregate_results(
         self, results: List[Dict], plan: QueryPlan

@@ -52,25 +52,38 @@ class VectorStore:
         logger.info(f"📁 存储路径: {self.store_path}")
         logger.info(f"📐 向量维度: {embedding_dim}")
     
-    def _create_faiss_index(self, dimension: int) -> faiss.Index:
+    def _create_faiss_index(self, dimension: int, num_docs: int = 0) -> faiss.Index:
         """
-        创建FAISS索引
+        创建FAISS索引 - 智能选择最优索引类型
         
         Args:
             dimension: 向量维度
+            num_docs: 预期文档数量
             
         Returns:
             faiss.Index: FAISS索引
         """
-        # 使用L2距离的平面索引（适合中小规模数据）
-        index = faiss.IndexFlatL2(dimension)
-        
-        # 如果数据量大，可以使用IVF索引
-        # nlist = 100  # 聚类中心数量
-        # quantizer = faiss.IndexFlatL2(dimension)
-        # index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
-        
-        logger.info(f"📊 创建FAISS索引: {type(index).__name__}")
+        # 根据数据规模选择最优索引
+        if num_docs < 10000:
+            # 小规模数据，使用FlatL2（精确搜索）
+            index = faiss.IndexFlatL2(dimension)
+            logger.info(f"📊 创建FlatL2索引: 精确搜索，适合{num_docs}个文档")
+            
+        elif num_docs < 100000:
+            # 中等规模数据，使用IVF索引
+            nlist = min(max(int(np.sqrt(num_docs)), 100), 4096)  # 聚类中心数
+            quantizer = faiss.IndexFlatL2(dimension)
+            index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
+            logger.info(f"📊 创建IVFFlat索引: {nlist}个聚类中心，适合{num_docs}个文档")
+            
+        else:
+            # 大规模数据，使用IVF+PQ索引（压缩存储）
+            nlist = min(int(np.sqrt(num_docs)), 4096)
+            m = min(dimension // 8, 64)  # PQ子量化器数量
+            quantizer = faiss.IndexFlatL2(dimension) 
+            index = faiss.IndexIVFPQ(quantizer, dimension, nlist, m, 8)
+            logger.info(f"📊 创建IVFPQ索引: {nlist}个聚类，{m}个PQ，适合{num_docs}个文档")
+            
         return index
     
     def build_index(self, chunks: List[DocumentChunk], batch_size: int = 32, embedding_manager=None) -> bool:
@@ -120,8 +133,13 @@ class VectorStore:
             self.embedding_dim = embeddings.shape[1]
             logger.info(f"📐 实际向量维度: {self.embedding_dim}")
             
-            # 创建FAISS索引
-            self.index = self._create_faiss_index(self.embedding_dim)
+            # 创建FAISS索引 - 传入文档数量用于优化
+            self.index = self._create_faiss_index(self.embedding_dim, len(chunks))
+            
+            # 如果使用IVF索引，需要训练
+            if hasattr(self.index, 'train'):
+                logger.info("🎯 训练IVF索引...")
+                self.index.train(embeddings.astype(np.float32))
             
             # 添加向量到索引
             logger.info("📊 添加向量到索引...")
@@ -217,15 +235,17 @@ class VectorStore:
     
     def search(self, query: str, top_k: int = 10, 
                province_filter: Optional[str] = None,
-               chunk_type_filter: Optional[str] = None) -> List[Tuple[DocumentChunk, float]]:
+               chunk_type_filter: Optional[str] = None,
+               use_gpu: bool = False) -> List[Tuple[DocumentChunk, float]]:
         """
-        搜索相关文档
+        搜索相关文档 - GPU加速版本
         
         Args:
             query: 查询文本
             top_k: 返回结果数量
             province_filter: 省份过滤
             chunk_type_filter: 块类型过滤
+            use_gpu: 是否使用GPU加速搜索
             
         Returns:
             List[Tuple[DocumentChunk, float]]: (文档块, 相似度分数)列表
@@ -243,17 +263,41 @@ class VectorStore:
                 logger.error("❌ 查询编码失败")
                 return []
             
-            # 搜索相似向量 - 支持大量检索
-            search_k = min(max(top_k * 4, 200), self.index.ntotal)  # 至少搜索200个结果，最多4倍
-            scores, indices = self.index.search(
+            # GPU加速搜索
+            index_to_use = self.index
+            if use_gpu and hasattr(faiss, 'StandardGpuResources'):
+                try:
+                    gpu_res = faiss.StandardGpuResources()
+                    index_to_use = faiss.index_cpu_to_gpu(gpu_res, 0, self.index)
+                    logger.debug("🚀 使用GPU加速搜索")
+                except Exception as e:
+                    logger.warning(f"⚠️ GPU搜索失败，使用CPU: {e}")
+                    index_to_use = self.index
+            
+            # 智能确定搜索范围
+            search_k = min(max(top_k * 4, 200), index_to_use.ntotal)
+            
+            # IVF索引需要设置搜索参数
+            if hasattr(index_to_use, 'nprobe'):
+                # 动态调整nprobe以平衡速度和准确性
+                original_nprobe = index_to_use.nprobe
+                index_to_use.nprobe = min(max(search_k // 50, 10), 100)
+                logger.debug(f"🎯 IVF搜索参数: nprobe={index_to_use.nprobe}")
+            
+            # 执行搜索
+            scores, indices = index_to_use.search(
                 query_embedding.astype(np.float32), 
                 search_k
             )
             
+            # 恢复原始nprobe设置
+            if hasattr(index_to_use, 'nprobe'):
+                index_to_use.nprobe = original_nprobe
+            
             results = []
             
             for score, idx in zip(scores[0], indices[0]):
-                if idx >= len(self.chunks):
+                if idx >= len(self.chunks) or idx < 0:
                     continue
                 
                 chunk = self.chunks[idx]
