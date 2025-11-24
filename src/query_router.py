@@ -420,7 +420,6 @@ class QueryRouter:
                 prompt,
                 timeout=SILICONFLOW_CONFIG["timeout"],
                 temperature=SILICONFLOW_CONFIG["temperature"],
-                max_tokens=SILICONFLOW_CONFIG["max_tokens"],
             )
 
             processing_time = time.time() - start_time

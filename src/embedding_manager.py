@@ -106,7 +106,7 @@ class JinaEmbeddingManager:
                     trust_remote_code=True,
                     attn_implementation=self.attn_implementation,
                     local_files_only=True,  # 强制只使用本地文件
-                    torch_dtype=torch.bfloat16,  # 使用模型配置中的数据类型
+                    dtype=torch.bfloat16,  # 使用模型配置中的数据类型
                 )
                 logger.info(f"✅ 成功使用 {self.attn_implementation} attention")
 
@@ -124,7 +124,7 @@ class JinaEmbeddingManager:
                             trust_remote_code=True,
                             attn_implementation="sdpa",
                             local_files_only=True,
-                            torch_dtype=torch.bfloat16,
+                            dtype=torch.bfloat16,
                         )
                         self.attn_implementation = "sdpa"
                         logger.info("✅ 成功使用 SDPA attention")
@@ -137,7 +137,7 @@ class JinaEmbeddingManager:
                             trust_remote_code=True,
                             attn_implementation="eager",
                             local_files_only=True,
-                            torch_dtype=torch.bfloat16,
+                            dtype=torch.bfloat16,
                         )
                         self.attn_implementation = "eager"
                         logger.info("✅ 使用 eager attention (标准实现)")
@@ -150,7 +150,7 @@ class JinaEmbeddingManager:
                         trust_remote_code=True,
                         attn_implementation="eager",
                         local_files_only=True,
-                        torch_dtype=torch.bfloat16,
+                        dtype=torch.bfloat16,
                     )
                     self.attn_implementation = "eager"
                     logger.info("✅ 使用 eager attention (标准实现)")
@@ -221,12 +221,14 @@ class JinaEmbeddingManager:
                         numpy_batch = []
                         for emb in batch_embeddings:
                             if isinstance(emb, torch.Tensor):
-                                numpy_batch.append(emb.detach().cpu().numpy())
+                                # 先转换为float32，避免BFloat16的NumPy不兼容问题
+                                numpy_batch.append(emb.detach().cpu().float().numpy())
                             else:
                                 numpy_batch.append(emb)
                         batch_embeddings = np.array(numpy_batch)
                     elif isinstance(batch_embeddings, torch.Tensor):
-                        batch_embeddings = batch_embeddings.detach().cpu().numpy()
+                        # 先转换为float32，避免BFloat16的NumPy不兼容问题
+                        batch_embeddings = batch_embeddings.detach().cpu().float().numpy()
 
                     embeddings.append(batch_embeddings)
 
@@ -240,7 +242,8 @@ class JinaEmbeddingManager:
             numpy_embeddings = []
             for emb in embeddings:
                 if isinstance(emb, torch.Tensor):
-                    numpy_embeddings.append(emb.cpu().numpy())
+                    # 先转换为float32，避免BFloat16的NumPy不兼容问题
+                    numpy_embeddings.append(emb.cpu().float().numpy())
                 else:
                     numpy_embeddings.append(emb)
 
