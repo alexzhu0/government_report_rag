@@ -79,11 +79,22 @@ python API_KIT/switch_api.py siliconflow
 python API_KIT/switch_api.py
 ```
 
-#### 2. 重启服务体验优化
+#### 2.1 重启服务体验优化
 ```bash
 # 重启API服务以应用所有优化
 API_KIT/start_all.bat
 ```
+### 2.2 初始化API服务
+API 服务器启动后，访问：
+
+POST http://localhost:8000/api/setup
+或使用浏览器访问 API 文档：
+
+http://localhost:8000/docs
+然后找到 /api/setup 端点，点击 "Try it out"，发送请求。
+
+### 2.3
+使用VPN时不要使用TURN模式
 
 #### 3. 性能监控
 查看日志中的优化效果标识：
